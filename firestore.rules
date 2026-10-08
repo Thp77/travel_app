@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function tripPath(id) { return /databases/$(database)/documents/trips/$(id); }
+    function invitePath(id) { return /databases/$(database)/documents/invites/$(id); }
+    function member(id) {
+      return signedIn() && request.auth.uid in get(tripPath(id)).data.memberIds;
+    }
+    function memberAfter(id) {
+      return signedIn() && request.auth.uid in getAfter(tripPath(id)).data.memberIds;
+    }
+    function date(value) { return value is string && value.matches('20[0-9]{2}-[0-9]{2}-[0-9]{2}'); }
+    function amount(value) { return value is int && value > 0 && value <= 10000000000; }
+    function validTrip(d) {
+      return d.keys().hasOnly(['name', 'budgetCents', 'startDate', 'endDate', 'ownerId', 'memberIds', 'lastInviteId', 'createdAt'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 100
+        && amount(d.budgetCents) && date(d.startDate) && date(d.endDate) && d.endDate >= d.startDate
+        && d.ownerId is string && d.createdAt is int
+        && d.memberIds is list && d.memberIds.size() > 0 && d.memberIds.size() <= 20
+        && d.memberIds.toSet().size() == d.memberIds.size() && d.ownerId in d.memberIds
+        && d.lastInviteId is string && d.lastInviteId.size() <= 100;
+    }
+    function joining(id) {
+      let d = request.resource.data;
+      let before = get(invitePath(d.lastInviteId)).data;
+      let after = getAfter(invitePath(d.lastInviteId)).data;
+      return signedIn() && !(request.auth.uid in resource.data.memberIds)
+        && d.diff(resource.data).affectedKeys().hasOnly(['memberIds', 'lastInviteId'])
+        && d.memberIds.size() == resource.data.memberIds.size() + 1
+        && d.memberIds.hasAll(resource.data.memberIds) && request.auth.uid in d.memberIds
+        && before.tripId == id && before.ownerId == resource.data.ownerId
+        && before.claimedBy == null && before.expiresAt > request.time
+        && after.claimedBy == request.auth.uid && after.claimedAt == request.time;
+    }
+    match /trips/{id} {
+      allow read: if signedIn() && request.auth.uid in resource.data.memberIds;
+      allow create: if signedIn() && validTrip(request.resource.data)
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.memberIds == [request.auth.uid]
+        && request.resource.data.lastInviteId == '';
+      allow update: if validTrip(request.resource.data)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && ((member(id) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'budgetCents', 'startDate', 'endDate']))
+          || joining(id));
+      // No root deletion: descendants and invitation access must not be orphaned accidentally.
+      allow delete: if false;
+
+      function validCountry(d) {
+        let parent = getAfter(tripPath(id)).data;
+        return d.keys().hasOnly(['name', 'flag', 'startDate', 'endDate', 'archived', 'createdAt'])
+          && d.name is string && d.name.size() > 0 && d.name.size() <= 80
+          && d.flag is string && d.flag.size() <= 16 && date(d.startDate)
+          && d.startDate >= parent.startDate && d.startDate <= parent.endDate
+          && d.endDate is string && (d.endDate == '' || (date(d.endDate) && d.endDate >= d.startDate && d.endDate <= parent.endDate))
+          && d.archived is bool && d.createdAt is int;
+      }
+      match /countries/{countryId} {
+        allow read: if member(id);
+        allow create: if memberAfter(id) && validCountry(request.resource.data);
+        allow update: if memberAfter(id) && validCountry(request.resource.data)
+          && request.resource.data.createdAt == resource.data.createdAt;
+        allow delete: if false;
+      }
+      function validExpense(d) {
+        let parent = getAfter(tripPath(id)).data;
+        return d.keys().hasOnly(['amountCents', 'category', 'countryId', 'date', 'note', 'createdBy', 'createdAt', 'deleted'])
+          && amount(d.amountCents) && d.category in ['Logement', 'Repas', 'Transports', 'Activités', 'Courses', 'Divers']
+          && d.countryId is string && d.countryId.matches('[a-zA-Z0-9_-]{1,100}')
+          && getAfter(/databases/$(database)/documents/trips/$(id)/countries/$(d.countryId)).data.name is string
+          && date(d.date) && d.date >= parent.startDate && d.date <= parent.endDate
+          && d.note is string && d.note.size() <= 200
+          && d.createdBy is string && d.createdAt is int && d.deleted is bool;
+      }
+      match /expenses/{expenseId} {
+        allow read: if member(id);
+        allow create: if memberAfter(id) && validExpense(request.resource.data)
+          && request.resource.data.createdBy == request.auth.uid && request.resource.data.deleted == false;
+        allow update: if memberAfter(id) && validExpense(request.resource.data)
+          && resource.data.deleted == false
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.createdAt == resource.data.createdAt;
+        allow delete: if false;
+      }
+    }
+    match /invites/{token} {
+      // The exact unguessable token can be read; invitations can never be enumerated.
+      allow get: if signedIn() && (resource.data.ownerId == request.auth.uid
+        || resource.data.claimedBy == request.auth.uid
+        || (resource.data.claimedBy == null && resource.data.expiresAt > request.time));
+      allow list: if false;
+      allow create: if signedIn() && token.matches('[a-f0-9]{32}')
+        && request.resource.data.keys().hasOnly(['tripId', 'tripName', 'ownerId', 'createdAt', 'expiresAt', 'claimedBy', 'claimedAt'])
+        && request.resource.data.tripId is string && request.resource.data.tripName is string
+        && request.resource.data.ownerId == request.auth.uid
+        && get(tripPath(request.resource.data.tripId)).data.ownerId == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt is timestamp && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(7, 'd')
+        && request.resource.data.claimedBy == null && request.resource.data.claimedAt == null;
+      allow update: if signedIn() && resource.data.claimedBy == null && resource.data.expiresAt > request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedBy', 'claimedAt'])
+        && request.resource.data.claimedBy == request.auth.uid && request.resource.data.claimedAt == request.time
+        && !(request.auth.uid in get(tripPath(resource.data.tripId)).data.memberIds)
+        && request.auth.uid in getAfter(tripPath(resource.data.tripId)).data.memberIds;
+      allow delete: if signedIn() && resource.data.ownerId == request.auth.uid;
+    }
+    match /feedback/{id} {
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['body', 'createdBy', 'createdAt', 'version'])
+        && request.resource.data.body is string && request.resource.data.body.size() >= 5 && request.resource.data.body.size() <= 3000
+        && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time
+        && request.resource.data.version == '0.1.0-beta';
+      allow read: if signedIn() && resource.data.createdBy == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}

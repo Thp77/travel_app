@@ -1,1697 +1,342 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
+import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut, updateProfile, type User } from 'firebase/auth'
+import { useRegisterSW } from 'virtual:pwa-register/react'
+import { auth, cloudEnabled } from './firebase'
+import { createInvite, createTrip, deleteExpense, errorMessage, joinTrip, saveCountry, saveExpense, saveTrip, sendFeedback, useRemoteData, useSession, useTrips } from './cloud'
+import { budgetStats, CATEGORIES, categoryBreakdown, daysInclusive, liveExpenses, money, parseMoney, readBackup, shortDate, todayISO, totalSpent, validPeriod, type Category, type Country, type Expense, type TravelData, type Trip } from './domain'
+import { downloadFile, exportJSON, saveLocalData, updateLocalData, useLocalData } from './local-store'
 
-type Category =
-  | "Logement"
-  | "Nourriture"
-  | "Transport"
-  | "Activités"
-  | "Shopping"
-  | "Santé"
-  | "Extras";
+type Tab = 'home' | 'countries' | 'settings'
+type Actions = {
+  trip: (trip: Trip) => void | Promise<void>
+  country: (country: Country, creating: boolean) => void | Promise<void>
+  expense: (expense: Expense, creating: boolean) => void | Promise<void>
+  removeExpense: (id: string) => void | Promise<void>
+}
+function useOnline() {
+  const [online, setOnline] = useState(navigator.onLine)
+  useEffect(() => {
+    const update = () => setOnline(navigator.onLine)
+    window.addEventListener('online', update); window.addEventListener('offline', update)
+    return () => { window.removeEventListener('online', update); window.removeEventListener('offline', update) }
+  }, [])
+  return online
+}
+function invitationCode() {
+  return new URLSearchParams(location.hash.slice(1)).get('invite') || ''
+}
+function Brand() {
+  return <header className="brand"><img src="/Logo.png" alt="" /><div><p>Travel <span>App</span></p><small>LE VOYAGE, L’ESPRIT LIBRE</small></div><span className="beta-badge">BÊTA</span></header>
+}
+function Banner({ children, error = false }: { children: ReactNode; error?: boolean }) {
+  return <div className={`banner ${error ? 'banner-error' : ''}`} role={error ? 'alert' : 'status'}>{children}</div>
+}
+function Loading() { return <div className="app-shell"><Brand /><div className="card loading" role="status">Chargement de votre voyage…</div></div> }
 
-type Expense = {
-  id: number;
-  amount: number;
-  category: Category;
-};
+export default function App() {
+  const session = useSession()
+  const [authOpen, setAuthOpen] = useState(!!invitationCode() && cloudEnabled)
+  const { needRefresh: [needRefresh, setNeedRefresh], updateServiceWorker } = useRegisterSW()
+  if (session.loading) return <Loading />
+  return <>
+    {needRefresh && <div className="update-bar" role="status"><span>Une nouvelle version est disponible.</span><button onClick={() => void updateServiceWorker(true)}>Mettre à jour</button><button aria-label="Plus tard" onClick={() => setNeedRefresh(false)}>×</button></div>}
+    {session.user ? <CloudHome key={session.user.uid} user={session.user} /> : authOpen && auth ? <AuthScreen onClose={() => setAuthOpen(false)} /> : <LocalHome onConnect={() => setAuthOpen(true)} />}
+  </>
+}
 
-type Country = {
-  id: number;
-  name: string;
-  flag: string;
-  budget: number;
-  imageUrl: string;
-  startDate: string;
-  endDate: string | null;
-  expenses: Expense[];
-  closed: boolean;
-};
+function LocalHome({ onConnect }: { onConnect: () => void }) {
+  const { data, error } = useLocalData()
+  const actions: Actions = {
+    trip: trip => updateLocalData(old => ({ ...old, trip })),
+    country: (country, creating) => updateLocalData(old => ({ ...old, countries: creating ? [...old.countries, country] : old.countries.map(c => c.id === country.id ? country : c) })),
+    expense: (expense, creating) => updateLocalData(old => {
+      if (!creating && !old.expenses.some(e => e.id === expense.id && !e.deleted)) throw new Error('Cette dépense a été supprimée entre-temps.')
+      return { ...old, expenses: creating ? [...old.expenses, expense] : old.expenses.map(e => e.id === expense.id ? expense : e) }
+    }),
+    removeExpense: id => updateLocalData(old => ({ ...old, expenses: old.expenses.map(e => e.id === id ? { ...e, deleted: true } : e) })),
+  }
+  return <Workspace data={data} actions={actions} error={error} onConnect={onConnect} />
+}
 
-type CountryWithDaily = Country & {
-  total: number;
-  days: number;
-  daily: number;
-};
-
-type BudgetScore = {
-  label: string;
-  color: string;
-  score: number;
-  stars: number;
-};
-
-type Tab = "home" | "countries" | "profile";
-
-const categories: { name: Category; icon: string; color: string }[] = [
-  { name: "Logement", icon: "🏠", color: "bg-[#ef6a2e]" },
-  { name: "Nourriture", icon: "🍜", color: "bg-[#f5b942]" },
-  { name: "Transport", icon: "🚌", color: "bg-[#57a773]" },
-  { name: "Activités", icon: "📷", color: "bg-[#3c91c9]" },
-  { name: "Shopping", icon: "🛍️", color: "bg-[#a76ccf]" },
-  { name: "Santé", icon: "💊", color: "bg-[#df4d4d]" },
-  { name: "Extras", icon: "✨", color: "bg-[#99F8FF]" },
-];
-
-const defaultCountries: Country[] = [
-  {
-    id: 1,
-    name: "Thaïlande",
-    flag: "🇹🇭",
-    budget: 3000,
-    imageUrl:
-      "https://images.unsplash.com/photo-1528181304800-259b08848526?auto=format&fit=crop&w=500&q=80",
-    startDate: "2026-03-01",
-    endDate: null,
-    closed: false,
-    expenses: [
-      { id: 1, category: "Logement", amount: 900 },
-      { id: 2, category: "Nourriture", amount: 650 },
-      { id: 3, category: "Transport", amount: 480 },
-      { id: 4, category: "Activités", amount: 520 },
-    ],
-  },
-];
-
-function App() {
-  const [activeTab, setActiveTab] = useState<Tab>("home");
-  const [selectedCountryId, setSelectedCountryId] = useState<number | null>(
-    null
-  );
-
-
-  const [userName, setUserName] = useState(() => {
-  return localStorage.getItem("tbt-user-name") || "Ludo";
-});
-
-const [profileImage, setProfileImage] = useState(() => {
-  return localStorage.getItem("tbt-profile-image") || "";
-});
-
-  const [budgetTotal, setBudgetTotal] = useState<number>(() => {
-    const saved = localStorage.getItem("tbt-budget-total");
-    return saved ? Number(saved) : 24000;
-  });
-
-  const [countries, setCountries] = useState<Country[]>(() => {
-    const saved = localStorage.getItem("tbt-countries");
-
+function CloudHome({ user }: { user: User }) {
+  const { trips, loaded, fromCache, pendingTripIds, error } = useTrips(user.uid)
+  const online = useOnline()
+  const [selected, setSelected] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [code, setCode] = useState(invitationCode())
+  const [joining, setJoining] = useState(false)
+  const [message, setMessage] = useState('')
+  const trip = trips.find(t => t.id === selected) || trips[0]
+  async function join(event: FormEvent) {
+    event.preventDefault(); setJoining(true); setMessage('')
     try {
-      if (!saved) return defaultCountries;
-
-      const parsed = JSON.parse(saved) as Partial<Country>[];
-
-      return parsed.map((country) => ({
-        id: country.id || Date.now(),
-        name: country.name || "Pays",
-        flag: country.flag || "🌍",
-        budget: country.budget || 0,
-        imageUrl: country.imageUrl || "",
-        startDate: country.startDate || new Date().toISOString().split("T")[0],
-        endDate: country.endDate || null,
-        expenses: country.expenses || [],
-        closed: country.closed || false,
-      }));
-    } catch {
-      return defaultCountries;
-    }
-  });
-
-  const [countryName, setCountryName] = useState("");
-  const [countryBudget, setCountryBudget] = useState("");
-  const [countryFlag, setCountryFlag] = useState("🌍");
-  const [countryImageUrl, setCountryImageUrl] = useState("");
-  const [countryStartDate, setCountryStartDate] = useState("");
-
-  const [expenseAmounts, setExpenseAmounts] = useState<Record<number, string>>(
-    {}
-  );
-
-  const [expenseCategories, setExpenseCategories] = useState<
-    Record<number, Category>
-  >({});
-
-  useEffect(() => {
-    localStorage.setItem("tbt-budget-total", String(budgetTotal));
-  }, [budgetTotal]);
-
-  useEffect(() => {
-    localStorage.setItem("tbt-countries", JSON.stringify(countries));
-  }, [countries]);
-
-
-  useEffect(() => {
-  localStorage.setItem("tbt-user-name", userName);
-}, [userName]);
-
-useEffect(() => {
-  localStorage.setItem("tbt-profile-image", profileImage);
-}, [profileImage]);
-  const getToday = () => new Date().toISOString().split("T")[0];
-
-  const getDaysBetweenDates = (startDate: string, endDate: string | null) => {
-    if (!startDate) return 0;
-
-    const start = new Date(startDate);
-    const end = new Date(endDate || getToday());
-    const diffTime = end.getTime() - start.getTime();
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-
-    return diffDays > 0 ? diffDays : 1;
-  };
-
-  const formatDate = (date: string | null) => {
-    if (!date) return "En cours";
-
-    return new Date(date).toLocaleDateString("fr-FR", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    });
-  };
-
-  const spent = countries.reduce(
-    (total, country) =>
-      total + country.expenses.reduce((sum, expense) => sum + expense.amount, 0),
-    0
-  );
-
-  const remaining = budgetTotal - spent;
-  const projectedTotal = Math.round(spent * 1.8);
-
-  const projectedPercent =
-    budgetTotal > 0 ? Math.round((projectedTotal / budgetTotal) * 100) : 0;
-
-  const allTravelDays = countries.reduce((total, country) => {
-    return total + getDaysBetweenDates(country.startDate, country.endDate);
-  }, 0);
-
-  const globalDailyAverage =
-    allTravelDays > 0 ? Math.round(spent / allTravelDays) : 0;
-
-  const remainingDaysEstimate = 180;
-
-  const remainingBudgetPerDay =
-    remainingDaysEstimate > 0 ? Math.round(remaining / remainingDaysEstimate) : 0;
-
-  const countriesWithDaily: CountryWithDaily[] = countries.map((country) => {
-    const total = country.expenses.reduce(
-      (sum, expense) => sum + expense.amount,
-      0
-    );
-
-    const days = getDaysBetweenDates(country.startDate, country.endDate);
-    const daily = days > 0 ? Math.round(total / days) : 0;
-
-    return {
-      ...country,
-      total,
-      days,
-      daily,
-    };
-  });
-
-  const mostExpensiveCountry = countriesWithDaily.reduce<CountryWithDaily | null>(
-    (highest, country) => {
-      if (!highest || country.daily > highest.daily) return country;
-      return highest;
-    },
-    null
-  );
-
-  const plannedDailyGlobal =
-    allTravelDays > 0 ? Math.round(budgetTotal / allTravelDays) : 0;
-
-  const rhythmDifference = plannedDailyGlobal - globalDailyAverage;
-
-  const budgetScore: BudgetScore =
-    projectedPercent <= 70
-      ? { label: "Excellent", color: "text-green-700", score: 86, stars: 4 }
-      : projectedPercent <= 90
-      ? { label: "Correct", color: "text-amber-600", score: 72, stars: 3 }
-      : projectedPercent <= 100
-      ? { label: "Attention", color: "text-orange-600", score: 58, stars: 2 }
-      : { label: "Dépassement", color: "text-red-600", score: 35, stars: 1 };
-
-  const getCategoryTotal = (category: Category) => {
-    return countries.reduce((total, country) => {
-      const categoryTotal = country.expenses
-        .filter((expense) => expense.category === category)
-        .reduce((sum, expense) => sum + expense.amount, 0);
-
-      return total + categoryTotal;
-    }, 0);
-  };
-
-  const addCountry = () => {
-    const budget = Number(countryBudget);
-    if (!countryName || !budget || !countryStartDate) return;
-
-    const newCountry: Country = {
-      id: Date.now(),
-      name: countryName,
-      flag: countryFlag || "🌍",
-      budget,
-      imageUrl:
-        countryImageUrl ||
-        "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=500&q=80",
-      startDate: countryStartDate,
-      endDate: null,
-      expenses: [],
-      closed: false,
-    };
-
-    setCountries((previousCountries) => [...previousCountries, newCountry]);
-    setCountryName("");
-    setCountryBudget("");
-    setCountryFlag("🌍");
-    setCountryImageUrl("");
-    setCountryStartDate("");
-    setSelectedCountryId(newCountry.id);
-    setActiveTab("countries");
-  };
-
-  const addExpenseToCountry = (countryId: number) => {
-    const amount = Number(expenseAmounts[countryId]);
-    const category = expenseCategories[countryId] || "Logement";
-    if (!amount) return;
-
-    setCountries((previousCountries) =>
-      previousCountries.map((country) =>
-        country.id === countryId
-          ? {
-              ...country,
-              expenses: [
-                ...country.expenses,
-                {
-                  id: Date.now(),
-                  amount,
-                  category,
-                },
-              ],
-            }
-          : country
-      )
-    );
-
-    setExpenseAmounts((previousAmounts) => ({
-      ...previousAmounts,
-      [countryId]: "",
-    }));
-  };
-
-  const deleteExpense = (countryId: number, expenseId: number) => {
-    const confirmed = window.confirm("Supprimer cette dépense ?");
-    if (!confirmed) return;
-
-    setCountries((previousCountries) =>
-      previousCountries.map((country) =>
-        country.id === countryId
-          ? {
-              ...country,
-              expenses: country.expenses.filter(
-                (expense) => expense.id !== expenseId
-              ),
-            }
-          : country
-      )
-    );
-  };
-
-  const closeCountry = (countryId: number) => {
-    setCountries((previousCountries) =>
-      previousCountries.map((country) =>
-        country.id === countryId
-          ? {
-              ...country,
-              closed: true,
-              endDate: getToday(),
-            }
-          : country
-      )
-    );
-  };
-
-  const deleteCountry = (countryId: number) => {
-    const confirmed = window.confirm(
-      "Supprimer ce pays et toutes ses dépenses ?"
-    );
-
-    if (!confirmed) return;
-
-    setCountries((previousCountries) =>
-      previousCountries.filter((country) => country.id !== countryId)
-    );
-
-    if (selectedCountryId === countryId) {
-      setSelectedCountryId(null);
-    }
-  };
-
-  const resetApp = () => {
-    localStorage.removeItem("tbt-budget-total");
-    localStorage.removeItem("tbt-countries");
-    setBudgetTotal(24000);
-    setCountries(defaultCountries);
-    setSelectedCountryId(null);
-    setActiveTab("home");
-  };
-
-  return (
-    <div className="min-h-screen bg-[#f7efe6] text-[#142536]">
-      <div className="mx-auto max-w-md px-4 pb-28 pt-4">
-        <Header />
-
-        {activeTab === "home" && (
-          <>
-<WelcomeCard userName={userName} profileImage={profileImage} />
-
-            <section className="mb-4 grid grid-cols-4 gap-2">
-              <StatCard
-                icon="💳"
-                label="Budget total"
-                value={`${budgetTotal.toLocaleString("fr-FR")} €`}
-                color="text-green-700"
-                bar="bg-green-600"
-              />
-              <StatCard
-                icon="📊"
-                label="Dépensé"
-                value={`${spent.toLocaleString("fr-FR")} €`}
-                color="text-[#ef6a2e]"
-                bar="bg-[#ef6a2e]"
-              />
-              <StatCard
-                icon="👛"
-                label="Restant"
-                value={`${remaining.toLocaleString("fr-FR")} €`}
-                color="text-sky-700"
-                bar="bg-sky-600"
-              />
-              <StatCard
-                icon="🗓️"
-                label="Pays"
-                value={`${countries.length}`}
-                color="text-amber-700"
-                bar="bg-amber-500"
-              />
-            </section>
-
-            <SmartStats
-              globalDailyAverage={globalDailyAverage}
-              remainingBudgetPerDay={remainingBudgetPerDay}
-              mostExpensiveCountry={mostExpensiveCountry}
-              rhythmDifference={rhythmDifference}
-              budgetScore={budgetScore}
-              projectedPercent={projectedPercent}
-              allTravelDays={allTravelDays}
-            />
-
-            <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-              <h2 className="mb-3 text-xl font-extrabold">Budget de base</h2>
-
-              <input
-                type="number"
-                value={budgetTotal}
-                onChange={(event) => setBudgetTotal(Number(event.target.value))}
-                className="w-full rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-              />
-            </section>
-
-            <ProjectionCard
-              projectedTotal={projectedTotal}
-              projectedPercent={projectedPercent}
-              budgetTotal={budgetTotal}
-            />
-
-            <ExpensesScreen spent={spent} getCategoryTotal={getCategoryTotal} />
-
-            <CountriesPreview
-              countries={countries}
-              getDaysBetweenDates={getDaysBetweenDates}
-              onSelectCountry={(countryId) => {
-                setSelectedCountryId(countryId);
-                setActiveTab("countries");
-              }}
-            />
-          </>
-        )}
-
-        {activeTab === "countries" && (
-          <CountriesScreen
-            countries={countries}
-            selectedCountryId={selectedCountryId}
-            setSelectedCountryId={setSelectedCountryId}
-            countryName={countryName}
-            countryBudget={countryBudget}
-            countryFlag={countryFlag}
-            countryImageUrl={countryImageUrl}
-            countryStartDate={countryStartDate}
-            expenseAmounts={expenseAmounts}
-            expenseCategories={expenseCategories}
-            setCountryName={setCountryName}
-            setCountryBudget={setCountryBudget}
-            setCountryFlag={setCountryFlag}
-            setCountryImageUrl={setCountryImageUrl}
-            setCountryStartDate={setCountryStartDate}
-            setExpenseAmounts={setExpenseAmounts}
-            setExpenseCategories={setExpenseCategories}
-            addCountry={addCountry}
-            addExpenseToCountry={addExpenseToCountry}
-            deleteExpense={deleteExpense}
-            closeCountry={closeCountry}
-            deleteCountry={deleteCountry}
-            getDaysBetweenDates={getDaysBetweenDates}
-            formatDate={formatDate}
-          />
-        )}
-
-{activeTab === "profile" && (
-  <ProfileScreen
-    userName={userName}
-    setUserName={setUserName}
-    profileImage={profileImage}
-    setProfileImage={setProfileImage}
-    budgetTotal={budgetTotal}
-    setBudgetTotal={setBudgetTotal}
-    resetApp={resetApp}
-  />
-)}      </div>
-
-      <BottomNav
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        setSelectedCountryId={setSelectedCountryId}
-      />
+      const token = code.includes('#invite=') ? code.split('#invite=')[1] : code.trim()
+      setSelected(await joinTrip(token, user.uid)); setCode('')
+      history.replaceState(null, '', location.pathname + location.search)
+    } catch (e) { setMessage(errorMessage(e)) }
+    finally { setJoining(false) }
+  }
+  if (!loaded && !error) return <Loading />
+  return <>
+    <div className="app-shell cloud-controls">
+      {error && <Banner error>{error}</Banner>}
+      <div className="trip-switcher">
+        {trips.length > 0 && <label>Voyage actif<select value={trip.id} onChange={e => { setSelected(e.target.value); setCreating(false) }}>{trips.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label>}
+        <button className="button secondary" onClick={() => setCreating(!creating)}>{creating ? 'Annuler' : '+ Nouveau voyage'}</button>
+      </div>
+      <details open={!!invitationCode()} className="card compact"><summary>Rejoindre le voyage d’un compagnon</summary><form className="inline-form" onSubmit={join}><label>Lien ou code d’invitation<input value={code} onChange={e => setCode(e.target.value)} autoComplete="off" required /></label><button className="button" disabled={joining || !online}>{joining ? 'Vérification…' : 'Rejoindre'}</button></form><small>Chaque invitation est valable 6 jours et utilisable une seule fois.</small>{message && <Banner error>{message}</Banner>}</details>
+      {fromCache && !trips.length && <Banner>Vos voyages ne sont pas encore disponibles sur cet appareil. Une première connexion est nécessaire.</Banner>}
+      {(creating || !trip) && <><Brand /><TripForm ownerId={user.uid} onSave={value => {
+        setSelected(value.id)
+        void createTrip(value).catch(e => setMessage(errorMessage(e)))
+        setCreating(false)
+        return true
+      }} />{message && <Banner error>{message}</Banner>}<button className="text-button" onClick={() => void signOut(auth!)}>Se déconnecter</button></>}
     </div>
-  );
+    {trip && !creating && <RemoteWorkspace key={trip.id} trip={trip} user={user} tripPending={pendingTripIds.includes(trip.id)} tripFromCache={fromCache} />}
+  </>
+}
+function RemoteWorkspace({ trip, user, tripPending, tripFromCache }: { trip: Trip; user: User; tripPending: boolean; tripFromCache: boolean }) {
+  const remote = useRemoteData(trip, tripPending)
+  const actions: Actions = {
+    trip: value => saveTrip(value),
+    country: (value, creating) => saveCountry(trip.id, value, creating),
+    expense: (value, creating) => saveExpense(trip.id, value, creating),
+    removeExpense: id => deleteExpense(trip.id, id),
+  }
+  if (remote.error) return <div className="app-shell"><Brand /><Banner error>{remote.error}</Banner><button className="button secondary" onClick={() => location.reload()}>Recharger le voyage</button></div>
+  if (!remote.loaded) return <Loading />
+  return <Workspace data={remote.data} actions={actions} user={user} pending={remote.pending || tripPending} fromCache={remote.fromCache || tripFromCache} />
 }
 
-function SmartStats({
-  globalDailyAverage,
-  remainingBudgetPerDay,
-  mostExpensiveCountry,
-  rhythmDifference,
-  budgetScore,
-  projectedPercent,
-  allTravelDays,
-}: {
-  globalDailyAverage: number;
-  remainingBudgetPerDay: number;
-  mostExpensiveCountry: CountryWithDaily | null;
-  rhythmDifference: number;
-  budgetScore: BudgetScore;
-  projectedPercent: number;
-  allTravelDays: number;
+function Workspace({ data, actions, user = null, pending = false, fromCache = false, error = '', onConnect }: {
+  data: TravelData; actions: Actions; user?: User | null; pending?: boolean; fromCache?: boolean; error?: string; onConnect?: () => void
 }) {
-  const safePercent = Math.min(projectedPercent, 100);
+  const online = useOnline()
+  const [tab, setTab] = useState<Tab>('home')
+  const [notice, setNotice] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [editing, setEditing] = useState<Expense | null>(null)
+  const trip = data.trip
+  function perform(action: () => void | Promise<void>, message: string) {
+    setActionError(''); setNotice('')
+    if (error) { setActionError(error); return false }
+    try {
+      const result = action()
+      setNotice(user ? `${message} Synchronisation en cours si nécessaire.` : message)
+      if (result) void result.catch(e => { setNotice(''); setActionError(errorMessage(e)) })
+      return true
+    } catch (e) { setActionError(errorMessage(e)); return false }
+  }
+  const status = !user ? (online ? 'Sur cet appareil' : 'Hors connexion · sur cet appareil') : pending ? 'En attente de synchronisation' : !online || fromCache ? 'Hors connexion ou vérification en cours' : 'Synchronisé'
+  return <div className="app-shell">
+    <Brand />
+    <div className="status-row"><span className={`status-dot ${user && !pending && online && !fromCache ? 'synced' : ''}`} /><span role="status">{status}</span>{!user && cloudEnabled && <button className="text-button" onClick={onConnect}>Se connecter</button>}</div>
+    {(error || actionError) && <Banner error>{error || actionError}<button className="dismiss" aria-label="Fermer le message" onClick={() => setActionError('')}>×</button></Banner>}
+    {notice && <Banner>{notice}<button className="dismiss" aria-label="Fermer la confirmation" onClick={() => setNotice('')}>×</button></Banner>}
+    {!trip ? <><section className="welcome card"><span className="eyebrow">VOTRE PROCHAIN DÉPART</span><h1>Un voyage.<br />Un budget commun.</h1><p>Gardez le cap sur vos dépenses, jour après jour, même sans réseau.</p><p className="muted">Votre budget couvre les dépenses sur place. Les vols internationaux et l’assurance restent à part.</p></section><TripForm ownerId={user?.uid || 'local'} onSave={value => perform(() => actions.trip(value), 'Voyage créé.')} />{!user && <p className="footnote">Vos données restent sur cet appareil. {cloudEnabled ? 'Connectez-vous pour retrouver votre voyage sur plusieurs téléphones.' : 'Le partage sera disponible dans la version connectée.'}</p>}</> : <>
+      {tab === 'home' && <>
+        <section className="welcome"><span className="eyebrow">{trip.name}</span><h1>Le voyage, l’esprit libre.</h1><p>{shortDate(trip.startDate)} → {shortDate(trip.endDate)}{user?.displayName && ` · Bonjour ${user.displayName}`}</p></section>
+        <Dashboard trip={trip} expenses={data.expenses} onConfigure={() => setTab('settings')} />
+        <div className="two-column"><div><ExpenseForm key={editing?.id || 'new'} trip={trip} countries={data.countries} userId={user?.uid || 'local'} editing={editing} onCancel={() => setEditing(null)} onSave={(value, creating) => {
+          const ok = perform(() => actions.expense(value, creating), 'Dépense enregistrée.')
+          if (ok) setEditing(null)
+          return ok
+        }} /><Breakdown expenses={data.expenses} /></div><ExpenseList countries={data.countries} expenses={data.expenses} onEdit={value => { setEditing(value); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onDelete={id => { if (window.confirm('Supprimer cette dépense du budget commun ?')) perform(() => actions.removeExpense(id), 'Dépense supprimée.') }} /></div>
+      </>}
+      {tab === 'countries' && <Countries trip={trip} countries={data.countries} expenses={data.expenses} onSave={(country, creating) => perform(() => actions.country(country, creating), 'Étape enregistrée.')} />}
+      {tab === 'settings' && <Settings data={data} user={user} online={online} pending={pending || fromCache} onSave={value => perform(() => {
+        if (data.countries.some(c => c.startDate < value.startDate || c.startDate > value.endDate || (c.endDate && c.endDate > value.endDate)) || liveExpenses(data.expenses).some(e => e.date < value.startDate || e.date > value.endDate)) throw new Error('Ces dates excluent une étape ou une dépense existante. Choisissez une période qui conserve votre historique.')
+        return actions.trip(value)
+      }, 'Budget et dates enregistrés.')} onError={setActionError} onConnect={onConnect} />}
+      <nav className="bottom-nav" aria-label="Navigation principale">
+        <button aria-current={tab === 'home' ? 'page' : undefined} onClick={() => setTab('home')}><span aria-hidden="true">🏠</span>Budget</button>
+        <button aria-current={tab === 'countries' ? 'page' : undefined} onClick={() => setTab('countries')}><span aria-hidden="true">🌍</span>Étapes</button>
+        <button className="quick-add" onClick={() => { setEditing(null); setTab('home'); requestAnimationFrame(() => document.getElementById('expense-amount')?.focus()) }} aria-label="Ajouter une dépense"><span>＋</span>Dépense</button>
+        <button aria-current={tab === 'settings' ? 'page' : undefined} onClick={() => setTab('settings')}><span aria-hidden="true">⚙️</span>Réglages</button>
+      </nav>
+    </>}
+    <footer>Travel App · 0.1.0 bêta · Montants en euros</footer>
+  </div>
+}
 
-  return (
-    <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-      <div className="mb-4 flex items-center justify-between">
-        <h2 className="text-xl font-extrabold">🧠 Stats intelligentes</h2>
+function TripForm({ initial, ownerId, onSave }: { initial?: Trip; ownerId: string; onSave: (value: Trip) => boolean }) {
+  const [name, setName] = useState(initial?.name || 'Mon voyage')
+  const [budget, setBudget] = useState(initial ? String(initial.budgetCents / 100) : '')
+  const [start, setStart] = useState(initial?.startDate || todayISO())
+  const [end, setEnd] = useState(initial?.endDate || '')
+  const [error, setError] = useState('')
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    const amount = parseMoney(budget)
+    if (!name.trim() || !amount || !validPeriod(start, end)) { setError('Indiquez un budget positif et une date de retour égale ou postérieure au départ.'); return }
+    setError('')
+    onSave({ ...(initial || { id: crypto.randomUUID(), ownerId, memberIds: [ownerId], lastInviteId: '', createdAt: Date.now() }), name: name.trim(), budgetCents: amount, startDate: start, endDate: end })
+  }
+  return <section className="card"><h2>{initial ? 'Budget et dates du voyage' : 'Préparer mon voyage'}</h2><form onSubmit={submit} className="form-grid">
+    <label className="full-width">Nom du voyage<input value={name} onChange={e => setName(e.target.value)} maxLength={100} required /></label>
+    <label className="full-width">Budget global sur place (€)<input inputMode="decimal" value={budget} onChange={e => setBudget(e.target.value)} placeholder="Ex. 12000" required /></label>
+    <label>Date de départ<input type="date" value={start} onChange={e => setStart(e.target.value)} required /></label>
+    <label>Date de retour<input type="date" min={start} value={end} onChange={e => setEnd(e.target.value)} required /></label>
+    <p className="help full-width">Un seul budget pour tout le voyage et tous les compagnons. Les dates restent modifiables.</p>
+    {error && <div className="full-width"><Banner error>{error}</Banner></div>}
+    <button className="button full-width">{initial ? 'Enregistrer le voyage' : 'Créer mon voyage'}</button>
+  </form></section>
+}
 
-        <span className="rounded-full bg-[#fff3e8] px-3 py-1 text-xs font-bold text-[#ef6a2e]">
-          5 insights
-        </span>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <InsightCard
-          title="Moyenne / jour"
-          value={`${globalDailyAverage.toLocaleString("fr-FR")} €`}
-          subtitle={`${allTravelDays} jours analysés`}
-          icon="📈"
-          tone="orange"
-        />
-
-        <InsightCard
-          title="Restant / jour"
-          value={`${remainingBudgetPerDay.toLocaleString("fr-FR")} €`}
-          subtitle="Pour rester dans le budget"
-          icon="💳"
-          tone="green"
-        />
-
-        <InsightCard
-          title="Pays le plus cher"
-          value={
-            mostExpensiveCountry
-              ? mostExpensiveCountry.name
-              : "Aucun pays"
-          }
-          subtitle={
-            mostExpensiveCountry
-              ? `${mostExpensiveCountry.daily.toLocaleString("fr-FR")} € / jour`
-              : "Ajoute une dépense"
-          }
-          icon={mostExpensiveCountry?.flag || "🌍"}
-          tone="purple"
-        />
-
-        <InsightCard
-          title="Alerte budget"
-          value={
-            rhythmDifference >= 0
-              ? `${rhythmDifference.toLocaleString("fr-FR")} €`
-              : `${Math.abs(rhythmDifference).toLocaleString("fr-FR")} €`
-          }
-          subtitle={rhythmDifference >= 0 ? "sous ton rythme" : "au-dessus"}
-          icon={rhythmDifference >= 0 ? "✅" : "⚠️"}
-          tone={rhythmDifference >= 0 ? "green" : "red"}
-        />
-
-        <div className="col-span-2 rounded-[26px] border-2 border-[#f3d79c] bg-gradient-to-br from-[#fffaf1] to-[#fff4d8] p-4 shadow-[0_12px_30px_rgba(145,100,40,0.12)]">
-          <div className="grid grid-cols-[86px_1fr] items-center gap-4">
-            <div
-              className="flex h-20 w-20 items-center justify-center rounded-full p-2 shadow-inner"
-              style={{
-                background: `conic-gradient(#58a65c ${safePercent}%, #eadfd5 ${safePercent}% 100%)`,
-              }}
-            >
-              <div className="flex h-full w-full flex-col items-center justify-center rounded-full bg-[#fffaf4]">
-                <strong className="text-xl">{budgetScore.score}</strong>
-                <span className="text-xs">/100</span>
-              </div>
-            </div>
-
-            <div>
-              <p className="text-sm font-bold text-[#8b7969]">
-                Score budget
-              </p>
-
-              <p className={`text-xl font-extrabold ${budgetScore.color}`}>
-                {budgetScore.label}
-              </p>
-
-              <p className="text-sm text-[#7d6b5c]">
-                Gestion actuelle du budget.
-              </p>
-
-              <p className="mt-1 text-xl text-[#f5b942]">
-                {"★".repeat(budgetScore.stars)}
-                <span className="text-[#e6d6c6]">
-                  {"★".repeat(5 - budgetScore.stars)}
-                </span>
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+function Dashboard({ trip, expenses, onConfigure }: { trip: Trip; expenses: Expense[]; onConfigure: () => void }) {
+  const stats = budgetStats(trip, expenses)
+  const percent = Math.max(0, Math.min(100, stats.spent / trip.budgetCents * 100))
+  return <>
+    <section className="stats-grid" aria-label="État du budget">
+      <div className="stat card"><span>Budget global</span><strong>{money(trip.budgetCents)}</strong><small>Dépenses sur place</small></div>
+      <div className="stat card"><span>Dépensé</span><strong className="orange">{money(stats.spent)}</strong><small>{liveExpenses(expenses).length} dépenses</small></div>
+      <div className="stat card"><span>Restant</span><strong className={stats.overspending ? 'red' : 'green'}>{money(stats.remaining)}</strong><small>Pour l’ensemble du voyage</small></div>
+      <div className="stat card daily"><span>Disponible / jour</span><strong>{stats.dailyAvailableCents === null ? '—' : money(stats.dailyAvailableCents)}</strong><small>{stats.remainingDays ? `${stats.remainingDays} jours restants · aujourd’hui inclus` : stats.dated ? 'Voyage terminé' : 'Dates à compléter'}</small></div>
     </section>
-  );
-}
-
-function InsightCard({
-  title,
-  value,
-  subtitle,
-  icon,
-  tone,
-}: {
-  title: string;
-  value: string;
-  subtitle: string;
-  icon: string;
-  tone: "orange" | "green" | "purple" | "red";
-}) {
-  const styles = {
-    orange: {
-      border: "border-[#ef6a2e]",
-      bg: "from-[#fffaf4] to-[#fff0df]",
-      iconBg: "bg-[#ffe0bd]",
-      iconText: "text-[#ef6a2e]",
-      value: "text-[#ef6a2e]",
-      pill: "bg-[#fff1e6] text-[#9b4f21]",
-    },
-    green: {
-      border: "border-green-500",
-      bg: "from-[#fffaf4] to-[#eaf8ee]",
-      iconBg: "bg-green-100",
-      iconText: "text-green-700",
-      value: "text-green-700",
-      pill: "bg-green-50 text-green-700",
-    },
-    purple: {
-      border: "border-purple-500",
-      bg: "from-[#fffaf4] to-[#f3e9ff]",
-      iconBg: "bg-purple-100",
-      iconText: "text-purple-700",
-      value: "text-purple-700",
-      pill: "bg-purple-50 text-purple-700",
-    },
-    red: {
-      border: "border-red-500",
-      bg: "from-[#fffaf4] to-[#ffe9e9]",
-      iconBg: "bg-red-100",
-      iconText: "text-red-600",
-      value: "text-red-600",
-      pill: "bg-red-50 text-red-600",
-    },
-  }[tone];
-
-  return (
-    <div
-      className={`relative min-h-[165px] overflow-hidden rounded-[26px] border-2 ${styles.border} bg-gradient-to-br ${styles.bg} p-4 shadow-[0_12px_30px_rgba(80,55,35,0.12)]`}
-    >
-      <div className="absolute -bottom-8 -right-8 h-24 w-24 rounded-full bg-white/40" />
-      <div className="absolute right-3 top-3 grid grid-cols-3 gap-1 opacity-25">
-        {Array.from({ length: 9 }).map((_, index) => (
-          <span
-            key={index}
-            className="h-1 w-1 rounded-full bg-[#8b7969]"
-          />
-        ))}
-      </div>
-
-      <div
-        className={`mb-3 flex h-12 w-12 items-center justify-center rounded-2xl ${styles.iconBg} text-2xl shadow-sm ${styles.iconText}`}
-      >
-        {icon}
-      </div>
-
-      <p className="text-[13px] font-extrabold leading-tight text-[#142536]">
-        {title}
-      </p>
-
-      <p className={`mt-2 text-[24px] font-black leading-tight ${styles.value}`}>
-        {value}
-      </p>
-
-      <div
-        className={`mt-3 inline-flex rounded-full px-3 py-1 text-[11px] font-bold ${styles.pill}`}
-      >
-        {subtitle}
-      </div>
-    </div>
-  );
-}
-
-function Header() {
-  return (
-    <header className="mb-5 flex flex-col items-center">
-      <img
-        src="/Logo.png"
-        alt="Travel Budget Tracker"
-        className="h-32 w-32 object-contain drop-shadow-md"
-      />
-
-      <div className="-mt-6 text-center">
-        <p className="text-[24px] font-extrabold leading-none tracking-tight">
-          Travel <span className="text-[#ef6a2e]">Budget</span>
-        </p>
-        <p className="mt-2 text-[15px] font-semibold leading-none tracking-[0.32em] text-[#8b7969]">
-          TRACKER
-        </p>
-      </div>
-    </header>
-  );
-}
-
-function WelcomeCard({
-  userName,
-  profileImage,
-}: {
-  userName: string;
-  profileImage: string;
-}) {
-  return (
-    <section className="mb-4 overflow-hidden rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-extrabold">Bonjour {userName} ! 👋</h1>
-          <p className="mt-1 text-sm text-[#7d6b5c]">
-            Ton tour du monde continue !
-          </p>
-        </div>
-
-        <div className="flex h-20 w-24 items-center justify-center overflow-hidden rounded-lg  border-2 border-[#ead6c1] bg-[#f9eadb]">
-          {profileImage ? (
-            <img
-              src={profileImage}
-              alt="Profil"
-              className="h-full w-full object-contain p-1"
-            />
-          ) : (
-            <span className="text-4xl">🎈</span>
-          )}
-        </div>
-      </div>
+    <section className={`card projection ${stats.atRisk ? 'at-risk' : ''}`}><div className="section-heading"><h2>Le rythme du voyage</h2><span>{Math.round(stats.spent / trip.budgetCents * 100)} % dépensés</span></div><progress value={percent} max="100" aria-label="Part du budget dépensée" />
+      {!stats.dated ? <p>Complétez la date de retour pour calculer le budget quotidien. <button className="text-button" onClick={onConfigure}>Définir les dates</button></p> : <div className="rhythm-grid"><div><small>Moyenne depuis le départ</small><strong>{stats.averageCents === null ? '—' : `${money(stats.averageCents)} / jour`}</strong><span>{stats.elapsedDays} jours écoulés</span></div><div><small>{stats.remainingDays ? 'Projection à la fin du voyage' : 'Total de fin de voyage'}</small><strong>{stats.projectedCents === null ? '—' : money(stats.projectedCents)}</strong><span>{stats.elapsedDays ? 'D’après les dépenses enregistrées' : 'Disponible après le départ'}</span></div></div>}
+      {stats.atRisk ? <Banner error>{stats.overspending ? `Le budget est dépassé de ${money(-stats.remaining)}.` : `À ce rythme, les dépenses pourraient dépasser le budget de ${money(stats.projectedCents! - trip.budgetCents)}. Le montant disponible par jour vous aide à ajuster la suite.`}</Banner> : stats.elapsedDays > 0 && stats.spent > 0 ? <p className="help green">Votre rythme actuel reste dans le budget.</p> : <p className="help">La projection évoluera avec vos dépenses. Les gros paiements ponctuels peuvent modifier la moyenne.</p>}
     </section>
-  );
+  </>
 }
 
-function StatCard({
-  icon,
-  label,
-  value,
-  color,
-  bar,
-}: {
-  icon: string;
-  label: string;
-  value: string;
-  color: string;
-  bar: string;
+function ExpenseForm({ trip, countries, userId, editing, onCancel, onSave }: {
+  trip: Trip; countries: Country[]; userId: string; editing: Expense | null; onCancel: () => void; onSave: (expense: Expense, creating: boolean) => boolean
 }) {
-  return (
-    <div className="rounded-[24px] border border-[#ead6c1] bg-[#fffaf4] p-3 text-center shadow-sm">
-      <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-[#f1eadf] text-xl">
-        {icon}
-      </div>
-
-      <p className="min-h-[32px] text-[11px] font-semibold leading-tight text-[#312820]">
-        {label}
-      </p>
-
-      <p className={`mt-1 text-base font-extrabold ${color}`}>{value}</p>
-
-      <div className={`mx-auto mt-3 h-1 w-8 rounded-full ${bar}`} />
-    </div>
-  );
+  const sorted = [...countries].sort((a, b) => Number(a.archived) - Number(b.archived) || b.startDate.localeCompare(a.startDate))
+  const [amount, setAmount] = useState(editing ? String(editing.amountCents / 100) : '')
+  const [countryId, setCountryId] = useState(editing?.countryId || sorted.find(c => c.startDate <= todayISO() && !c.archived)?.id || sorted[0]?.id || '')
+  const [category, setCategory] = useState<Category>(editing?.category || 'Repas')
+  const [date, setDate] = useState(editing?.date || [todayISO(), trip.endDate || todayISO()].sort()[0])
+  const [note, setNote] = useState(editing?.note || '')
+  const [error, setError] = useState('')
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    const cents = parseMoney(amount)
+    const selectedId = countryId || sorted[0]?.id
+    if (!cents) { setError('Saisissez un montant positif, avec au maximum deux décimales.'); return }
+    if (!validPeriod(trip.startDate, trip.endDate) || date < trip.startDate || date > trip.endDate || date > todayISO()) { setError('La date doit être comprise dans le voyage et ne pas être dans le futur.'); return }
+    if (!countries.some(c => c.id === selectedId)) { setError('Ajoutez une étape avant de saisir votre dépense.'); return }
+    // eslint-disable-next-line react-hooks/purity -- This timestamp is created only by the form submit event, never during render.
+    const metadata = editing ? { id: editing.id, createdAt: editing.createdAt, createdBy: editing.createdBy, deleted: editing.deleted } : { id: crypto.randomUUID(), createdAt: Date.now(), createdBy: userId, deleted: false }
+    const ok = onSave({ ...metadata, amountCents: cents, category, countryId: selectedId, date, note: note.trim() }, !editing)
+    if (ok) { setAmount(''); setNote(''); setError('') }
+  }
+  return <section className="card" id="expense-form"><div className="section-heading"><h2>{editing ? 'Modifier la dépense' : 'Ajouter une dépense'}</h2><span className="small-pill">EN EUROS</span></div>{!countries.length ? <p className="empty">Ajoutez votre première étape dans l’onglet Étapes pour commencer.</p> : <form onSubmit={submit} className="form-grid">
+    <label>Montant (€)<input id="expense-amount" inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0,00" autoComplete="off" required /></label>
+    <label>Catégorie<select value={category} onChange={e => setCategory(e.target.value as Category)}>{CATEGORIES.map(c => <option key={c.name}>{c.name}</option>)}</select></label>
+    <label>Pays / étape<select value={countryId || sorted[0]?.id || ''} onChange={e => setCountryId(e.target.value)}>{sorted.map(c => <option value={c.id} key={c.id}>{c.flag} {c.name}{c.archived ? ' · terminée' : ''}</option>)}</select></label>
+    <label>Date de la dépense<input type="date" value={date} min={trip.startDate} max={[todayISO(), trip.endDate || todayISO()].sort()[0]} onChange={e => setDate(e.target.value)} required /></label>
+    <label className="full-width">Note (facultative)<input value={note} onChange={e => setNote(e.target.value)} placeholder="Dîner, hôtel, billets de bus…" maxLength={200} /></label>
+    {error && <div className="full-width"><Banner error>{error}</Banner></div>}
+    <button className="button full-width">{editing ? 'Enregistrer la modification' : 'Enregistrer la dépense'}</button>
+    {editing && <button type="button" className="text-button full-width" onClick={onCancel}>Annuler la modification</button>}
+  </form>}</section>
 }
 
-function ProjectionCard({
-  projectedTotal,
-  projectedPercent,
-  budgetTotal,
-}: {
-  projectedTotal: number;
-  projectedPercent: number;
-  budgetTotal: number;
-}) {
-  const projectedDiff = budgetTotal - projectedTotal;
-  const safePercent = Math.min(projectedPercent, 100);
-
-  return (
-    <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-      <h2 className="mb-5 text-xl font-extrabold">
-        ✨ Projection de fin de voyage
-      </h2>
-
-      <div className="grid grid-cols-[1fr_112px] items-center gap-4">
-        <div>
-          <p className="text-sm text-[#7d6b5c]">Dépense totale estimée</p>
-
-          <p className="mt-1 text-4xl font-extrabold">
-            {projectedTotal.toLocaleString("fr-FR")} €
-          </p>
-
-          <p
-            className={`mt-3 text-sm font-bold ${
-              projectedDiff >= 0 ? "text-green-700" : "text-red-600"
-            }`}
-          >
-            {projectedDiff >= 0
-              ? `✅ Soit ${projectedDiff.toLocaleString(
-                  "fr-FR"
-                )} € sous le budget !`
-              : `⚠️ ${Math.abs(projectedDiff).toLocaleString(
-                  "fr-FR"
-                )} € au-dessus du budget`}
-          </p>
-        </div>
-
-        <div className="flex flex-col items-center">
-          <div
-            className="flex h-24 w-24 items-center justify-center rounded-full p-3"
-            style={{
-              background: `conic-gradient(#58a65c ${safePercent}%, #eadfd5 ${safePercent}% 100%)`,
-            }}
-          >
-            <div className="flex h-full w-full items-center justify-center rounded-full bg-[#fffaf4]">
-              <span className="text-2xl font-extrabold">{safePercent}%</span>
-            </div>
-          </div>
-
-          <p className="mt-2 text-center text-xs text-[#7d6b5c]">
-            du budget utilisé
-          </p>
-        </div>
-      </div>
-
-      <div className="mt-5 h-3 rounded-full bg-[#eadfd5]">
-        <div
-          className={`h-3 rounded-full ${
-            projectedPercent > 100 ? "bg-red-500" : "bg-green-600"
-          }`}
-          style={{ width: `${safePercent}%` }}
-        />
-      </div>
-    </section>
-  );
+function Breakdown({ expenses }: { expenses: Expense[] }) {
+  const breakdown = categoryBreakdown(expenses)
+  return <section className="card"><h2>Où passe le budget ?</h2><div className="breakdown"><div className="donut" role="img" aria-label={`Répartition de ${money(breakdown.spent)} par catégorie`} style={{ background: breakdown.gradient }}><div><strong>{money(breakdown.spent)}</strong><small>sur place</small></div></div><ul>{breakdown.items.map(c => <li key={c.name}><span className="color-dot" style={{ background: c.color }} /><span>{c.icon} {c.name}</span><strong>{money(c.total)}</strong><small>{Math.round(c.percent)} %</small></li>)}</ul></div></section>
 }
 
-function ExpensesScreen({
-  spent,
-  getCategoryTotal,
-}: {
-  spent: number;
-  getCategoryTotal: (category: Category) => number;
-}) {
-  return (
-    <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-      <h2 className="mb-4 text-xl font-extrabold">
-        Répartition des dépenses
-      </h2>
-
-      <div className="grid grid-cols-[120px_1fr] items-center gap-4">
-        <div className="flex aspect-square items-center justify-center rounded-full bg-[conic-gradient(#ef6a2e_0_36%,#f5b942_36%_60%,#57a773_60%_77%,#3c91c9_77%_91%,#a76ccf_91%_97%,#df4d4d_97%_99%,#99F8FF_99%_100%)] p-5">
-          <div className="flex h-full w-full flex-col items-center justify-center rounded-full bg-[#fffaf4] text-center">
-            <strong className="text-sm">
-              {spent.toLocaleString("fr-FR")} €
-            </strong>
-            <span className="text-[10px] text-[#7d6b5c]">dépensés</span>
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          {categories.map((category) => {
-            const total = getCategoryTotal(category.name);
-            const percent = spent > 0 ? Math.round((total / spent) * 100) : 0;
-
-            return (
-              <div
-                key={category.name}
-                className="grid grid-cols-[22px_1fr_auto_30px] items-center gap-2 text-sm"
-              >
-                <span
-                  className={`h-2.5 w-2.5 rounded-full ${category.color}`}
-                />
-
-                <span className="truncate">
-                  {category.icon} {category.name}
-                </span>
-
-                <span className="font-bold">
-                  {total.toLocaleString("fr-FR")} €
-                </span>
-
-                <span className="text-right text-[#8b7969]">{percent}%</span>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </section>
-  );
+function ExpenseList({ expenses, countries, onEdit, onDelete }: { expenses: Expense[]; countries: Country[]; onEdit: (expense: Expense) => void; onDelete: (id: string) => void }) {
+  const [country, setCountry] = useState('')
+  const [category, setCategory] = useState('')
+  const [limit, setLimit] = useState(20)
+  const filtered = liveExpenses(expenses).filter(e => (!country || e.countryId === country) && (!category || e.category === category)).sort((a, b) => b.date.localeCompare(a.date) || b.createdAt - a.createdAt || a.id.localeCompare(b.id))
+  return <section className="card"><div className="section-heading"><h2>Vos dépenses</h2><span>{filtered.length}</span></div><div className="form-grid filters"><label>Filtrer par étape<select value={country} onChange={e => setCountry(e.target.value)}><option value="">Toutes les étapes</option>{countries.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label><label>Filtrer par catégorie<select value={category} onChange={e => setCategory(e.target.value)}><option value="">Toutes les catégories</option>{CATEGORIES.map(c => <option key={c.name}>{c.name}</option>)}</select></label></div>
+    {!filtered.length && <p className="empty">Aucune dépense{expenses.length ? ' pour ces filtres' : ' pour le moment'}. Le prochain repas sera peut-être la première !</p>}
+    <ul className="expense-list">{filtered.slice(0, limit).map(e => <li key={e.id}><span className="expense-icon">{CATEGORIES.find(c => c.name === e.category)?.icon}</span><div className="expense-detail"><strong>{e.note || e.category}</strong><small>{shortDate(e.date)} · {countries.find(c => c.id === e.countryId)?.name || 'Étape'} · {e.category}</small></div><div className="expense-actions"><strong>{money(e.amountCents)}</strong><div><button className="text-button" aria-label={`Modifier ${e.note || e.category}`} onClick={() => onEdit(e)}>Modifier</button><button className="text-button red" aria-label={`Supprimer ${e.note || e.category}`} onClick={() => onDelete(e.id)}>Supprimer</button></div></div></li>)}</ul>
+    {filtered.length > limit && <button className="button secondary" onClick={() => setLimit(limit + 20)}>Voir les dépenses suivantes</button>}
+  </section>
 }
 
-function CountriesPreview({
-  countries,
-  onSelectCountry,
-  getDaysBetweenDates,
-}: {
-  countries: Country[];
-  onSelectCountry: (countryId: number) => void;
-  getDaysBetweenDates: (startDate: string, endDate: string | null) => number;
-}) {
-  return (
-    <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-      <div className="mb-4 flex items-center justify-between">
-        <h2 className="text-xl font-extrabold">Par pays / étape</h2>
-        <span className="text-sm font-bold text-[#ef6a2e]">
-          Voir tous les pays ›
-        </span>
-      </div>
-
-      <div className="space-y-4">
-        {countries.slice(0, 3).map((country) => {
-          const total = country.expenses.reduce(
-            (sum, expense) => sum + expense.amount,
-            0
-          );
-
-          const percent = Math.round((total / country.budget) * 100 || 0);
-          const days = getDaysBetweenDates(country.startDate, country.endDate);
-          const realDaily = days > 0 ? Math.round(total / days) : 0;
-
-          return (
-            <button
-              key={country.id}
-              onClick={() => onSelectCountry(country.id)}
-              className="w-full rounded-3xl bg-white p-3 text-left shadow-sm transition active:scale-[0.98]"
-            >
-              <CountryRow
-                country={country}
-                total={total}
-                percent={percent}
-                days={days}
-                realDaily={realDaily}
-              />
-            </button>
-          );
-        })}
-      </div>
-    </section>
-  );
+function Countries({ trip, countries, expenses, onSave }: { trip: Trip; countries: Country[]; expenses: Expense[]; onSave: (country: Country, creating: boolean) => boolean }) {
+  const [name, setName] = useState('')
+  const [flag, setFlag] = useState('🌍')
+  const [start, setStart] = useState([todayISO(), trip.startDate].sort().at(-1)!)
+  const [error, setError] = useState('')
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!name.trim() || !validPeriod(trip.startDate, trip.endDate) || start < trip.startDate || start > trip.endDate) { setError('Complétez les dates du voyage et choisissez une date d’étape comprise dans cette période.'); return }
+    if (onSave({ id: crypto.randomUUID(), name: name.trim(), flag: flag || '🌍', startDate: start, endDate: '', archived: false, createdAt: Date.now() }, true)) { setName(''); setError('') }
+  }
+  return <><section className="welcome"><span className="eyebrow">LE PARCOURS</span><h1>Vos étapes, vos souvenirs.</h1><p>Les dépenses sont regroupées par pays. Votre budget reste global.</p></section><div className="two-column"><section className="card"><h2>Ajouter une étape</h2><form className="form-grid" onSubmit={submit}><label>Pays / ville<input value={name} onChange={e => setName(e.target.value)} placeholder="Thaïlande, Chiang Mai…" required maxLength={80} /></label><label>Drapeau<input value={flag} onChange={e => setFlag(e.target.value)} maxLength={16} /></label><label className="full-width">Début de l’étape<input type="date" value={start} min={trip.startDate} max={trip.endDate || undefined} onChange={e => setStart(e.target.value)} required /></label>{error && <div className="full-width"><Banner error>{error}</Banner></div>}<button className="button full-width">Créer l’étape</button></form></section><div>
+    {!countries.length && <section className="card empty">Aucune étape pour le moment. Ajoutez votre premier pays.</section>}
+    {[...countries].sort((a, b) => Number(a.archived) - Number(b.archived) || b.startDate.localeCompare(a.startDate)).map(c => {
+      const spent = totalSpent(expenses.filter(e => e.countryId === c.id))
+      const lastDay = [c.endDate || todayISO(), todayISO(), trip.endDate || todayISO()].sort()[0]
+      const days = daysInclusive(c.startDate, lastDay)
+      const endDate = [todayISO(), trip.endDate || todayISO()].sort()[0]
+      return <section className="card country-card" key={c.id}><div className="section-heading"><div><span className="country-flag">{c.flag}</span><h2>{c.name}</h2></div><span className="small-pill">{c.archived ? 'TERMINÉE' : c.startDate > todayISO() ? 'À VENIR' : 'EN COURS'}</span></div><p className="help">{shortDate(c.startDate)} → {c.endDate ? shortDate(c.endDate) : 'En cours'}</p><div className="country-totals"><strong>{money(spent)}</strong><span>{days ? `${money(Math.round(spent / days))} / jour · ${days} jours` : 'Étape à venir'}</span></div><button className="button secondary" disabled={!c.archived && endDate < c.startDate} onClick={() => onSave({ ...c, archived: !c.archived, endDate: c.archived ? '' : endDate }, false)}>{c.archived ? 'Rouvrir cette étape' : 'Terminer cette étape'}</button><small className="help">L’historique des dépenses est conservé.</small></section>
+    })}
+  </div></div></>
 }
 
-function CountriesScreen({
-  countries,
-  selectedCountryId,
-  setSelectedCountryId,
-  countryName,
-  countryBudget,
-  countryFlag,
-  countryImageUrl,
-  countryStartDate,
-  expenseAmounts,
-  expenseCategories,
-  setCountryName,
-  setCountryBudget,
-  setCountryFlag,
-  setCountryImageUrl,
-  setCountryStartDate,
-  setExpenseAmounts,
-  setExpenseCategories,
-  addCountry,
-  addExpenseToCountry,
-  deleteExpense,
-  closeCountry,
-  deleteCountry,
-  getDaysBetweenDates,
-  formatDate,
-}: {
-  countries: Country[];
-  selectedCountryId: number | null;
-  setSelectedCountryId: Dispatch<SetStateAction<number | null>>;
-  countryName: string;
-  countryBudget: string;
-  countryFlag: string;
-  countryImageUrl: string;
-  countryStartDate: string;
-  expenseAmounts: Record<number, string>;
-  expenseCategories: Record<number, Category>;
-  setCountryName: (value: string) => void;
-  setCountryBudget: (value: string) => void;
-  setCountryFlag: (value: string) => void;
-  setCountryImageUrl: (value: string) => void;
-  setCountryStartDate: (value: string) => void;
-  setExpenseAmounts: Dispatch<SetStateAction<Record<number, string>>>;
-  setExpenseCategories: Dispatch<SetStateAction<Record<number, Category>>>;
-  addCountry: () => void;
-  addExpenseToCountry: (countryId: number) => void;
-  deleteExpense: (countryId: number, expenseId: number) => void;
-  closeCountry: (countryId: number) => void;
-  deleteCountry: (countryId: number) => void;
-  getDaysBetweenDates: (startDate: string, endDate: string | null) => number;
-  formatDate: (date: string | null) => string;
-}) {
-  const activeCountries = countries.filter((country) => !country.closed);
-  const closedCountries = countries.filter((country) => country.closed);
-
-  return (
-    <>
-      <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-        <h2 className="mb-3 text-xl font-extrabold">Ajouter un pays</h2>
-
-        <div className="grid grid-cols-[1fr_80px] gap-2">
-          <input
-            value={countryName}
-            onChange={(event) => setCountryName(event.target.value)}
-            placeholder="Pays"
-            className="rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-          />
-
-          <input
-            value={countryFlag}
-            onChange={(event) => setCountryFlag(event.target.value)}
-            placeholder="🇯🇵"
-            className="rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-          />
-        </div>
-
-        <input
-          type="number"
-          value={countryBudget}
-          onChange={(event) => setCountryBudget(event.target.value)}
-          placeholder="Budget prévu"
-          className="mt-2 w-full rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-        />
-
-        <label className="mt-3 block text-sm font-bold text-[#8b7969]">
-          Date de début
-        </label>
-
-        <input
-          type="date"
-          value={countryStartDate}
-          onChange={(event) => setCountryStartDate(event.target.value)}
-          className="mt-1 w-full rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-        />
-
-        <div className="mt-2">
-          <label className="mb-1 block text-sm font-bold text-[#8b7969]">
-            Photo du pays
-          </label>
-
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (!file) return;
-
-              const reader = new FileReader();
-              reader.onloadend = () => {
-                setCountryImageUrl(reader.result as string);
-              };
-              reader.readAsDataURL(file);
-            }}
-            className="w-full rounded-xl border border-[#ead6c1] bg-white px-3 py-2 text-sm outline-none"
-          />
-
-          {countryImageUrl && (
-            <img
-              src={countryImageUrl}
-              alt="Aperçu du pays"
-              className="mt-3 h-28 w-full rounded-xl object-cover"
-            />
-          )}
-        </div>
-
-        <button
-          onClick={addCountry}
-          className="mt-3 w-full rounded-xl bg-[#ef6a2e] py-3 font-extrabold text-white"
-        >
-          Créer l’étape
-        </button>
-      </section>
-
-      <CountryGroup
-        title="Pays en cours"
-        emptyMessage="Aucun pays en cours pour le moment."
-        countries={activeCountries}
-        selectedCountryId={selectedCountryId}
-        setSelectedCountryId={setSelectedCountryId}
-        expenseAmounts={expenseAmounts}
-        expenseCategories={expenseCategories}
-        setExpenseAmounts={setExpenseAmounts}
-        setExpenseCategories={setExpenseCategories}
-        addExpenseToCountry={addExpenseToCountry}
-        deleteExpense={deleteExpense}
-        closeCountry={closeCountry}
-        deleteCountry={deleteCountry}
-        getDaysBetweenDates={getDaysBetweenDates}
-        formatDate={formatDate}
-        canEdit
-      />
-
-      <CountryGroup
-        title="Pays terminés"
-        emptyMessage="Aucun pays terminé pour le moment."
-        countries={closedCountries}
-        selectedCountryId={selectedCountryId}
-        setSelectedCountryId={setSelectedCountryId}
-        expenseAmounts={expenseAmounts}
-        expenseCategories={expenseCategories}
-        setExpenseAmounts={setExpenseAmounts}
-        setExpenseCategories={setExpenseCategories}
-        addExpenseToCountry={addExpenseToCountry}
-        deleteExpense={deleteExpense}
-        closeCountry={closeCountry}
-        deleteCountry={deleteCountry}
-        getDaysBetweenDates={getDaysBetweenDates}
-        formatDate={formatDate}
-        canEdit={false}
-      />
-    </>
-  );
+function Settings({ data, user, online, pending, onSave, onError, onConnect }: { data: TravelData; user: User | null; online: boolean; pending: boolean; onSave: (trip: Trip) => boolean; onError: (error: string) => void; onConnect?: () => void }) {
+  const [invite, setInvite] = useState('')
+  const [inviteBusy, setInviteBusy] = useState(false)
+  const [feedback, setFeedback] = useState('')
+  const [feedbackBusy, setFeedbackBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const trip = data.trip!
+  async function generateInvite() {
+    setInviteBusy(true)
+    try { setInvite(`${location.origin}${location.pathname}#invite=${await createInvite(trip, user!.uid)}`) }
+    catch (e) { onError(errorMessage(e)) }
+    finally { setInviteBusy(false) }
+  }
+  async function feedbackSubmit(event: FormEvent) {
+    event.preventDefault(); setFeedbackBusy(true)
+    try {
+      if (feedback.trim().length < 5) throw new Error('Décrivez votre retour en au moins 5 caractères.')
+      if (user) { await sendFeedback(user.uid, feedback.trim()); setMessage('Merci ! Votre retour a été enregistré.'); setFeedback('') }
+      else { downloadFile(`Travel App 0.1.0 bêta\n\n${feedback.trim()}`, 'retour-travel-app.txt'); setMessage('Votre retour est prêt à être partagé.') }
+    } catch (e) { onError(errorMessage(e)) }
+    finally { setFeedbackBusy(false) }
+  }
+  return <><section className="welcome"><span className="eyebrow">LES RÉGLAGES</span><h1>Un budget qui vous suit.</h1></section><div className="two-column"><div><TripForm key={trip.id} initial={trip} ownerId={trip.ownerId} onSave={onSave} /><section className="card"><h2>Sauvegarder mes données</h2><p className="help">Une copie du voyage, des étapes et des dépenses au format JSON.</p><button className="button secondary" onClick={() => exportJSON(data)}>Exporter ma sauvegarde</button>{!user && <><label className="import-label">Restaurer une sauvegarde<input type="file" accept=".json,application/json" onChange={async e => {
+      const file = e.target.files?.[0]; if (!file) return
+      try {
+        if (file.size > 10_000_000) throw new Error('Cette sauvegarde est trop volumineuse (maximum 10 Mo).')
+        const restored = readBackup(JSON.parse(await file.text()))
+        if (!window.confirm('Remplacer les données de cet appareil par cette sauvegarde ? Exportez d’abord votre voyage actuel.')) return
+        saveLocalData({ ...restored, trip: restored.trip ? { ...restored.trip, ownerId: 'local', memberIds: ['local'], lastInviteId: '' } : null })
+        setMessage('Sauvegarde restaurée sur cet appareil.')
+      } catch (error) { onError(errorMessage(error)) }
+      finally { e.target.value = '' }
+    }} /></label><p className="help">Les données de l’ancienne version restent conservées sur cet appareil. Une restauration ne modifie aucun voyage partagé.</p></>}</section></div><div>
+    <section className="card"><h2>Voyager ensemble</h2>{user ? <><p>{user.email}</p><p className="help">{trip.memberIds.length} compagnon{trip.memberIds.length > 1 ? 's' : ''}, vous compris. Les membres de ce voyage peuvent consulter et modifier les dépenses.</p>{trip.ownerId === user.uid ? <><button className="button secondary" disabled={!online || inviteBusy} onClick={() => void generateInvite()}>{inviteBusy ? 'Création…' : 'Créer une invitation'}</button>{invite && <div className="invite-result"><label>Lien à partager<input readOnly value={invite} onFocus={e => e.target.select()} /></label><button className="text-button" onClick={() => void navigator.clipboard.writeText(invite).then(() => setMessage('Lien copié.')).catch(() => setMessage('Sélectionnez le lien pour le copier.'))}>Copier le lien</button><small>Valable 6 jours, pour un seul compagnon. Créez un nouveau lien pour chaque personne.</small></div>}</> : <p className="help">Le créateur du voyage peut inviter d’autres compagnons.</p>}<button className="text-button logout" disabled={!online || pending} onClick={() => {
+      if (window.confirm('Se déconnecter ? Vérifiez que le statut indique « Synchronisé » avant de changer de compte.')) void signOut(auth!).catch(e => onError(errorMessage(e)))
+    }}>Se déconnecter</button>{pending && <p className="help">La déconnexion sera disponible après la synchronisation de vos données.</p>}</> : <><p className="help">Ce voyage est actuellement enregistré sur cet appareil. Exportez-le avant de changer de téléphone.</p>{cloudEnabled ? <button className="button secondary" onClick={onConnect}>Se connecter pour partager</button> : <p className="help">La connexion et les invitations seront disponibles dans la version connectée.</p>}</>}</section>
+    <section className="card"><h2>Votre avis fait voyager l’app</h2><p className="help">Un bug, une idée ou quelque chose qui manque ? Aucun montant de votre budget n’est ajouté à votre retour.</p><form onSubmit={feedbackSubmit}><label>Votre retour<textarea value={feedback} onChange={e => setFeedback(e.target.value)} minLength={5} maxLength={3000} rows={4} required placeholder="Ce qui s’est passé, ce que vous attendiez…" /></label><button className="button secondary" disabled={feedbackBusy || (!!user && !online)}>{feedbackBusy ? 'Envoi…' : user ? 'Envoyer mon retour' : 'Télécharger mon retour'}</button></form></section>
+    {message && <Banner>{message}</Banner>}
+  </div></div></>
 }
 
-function CountryGroup({
-  title,
-  emptyMessage,
-  countries,
-  selectedCountryId,
-  setSelectedCountryId,
-  expenseAmounts,
-  expenseCategories,
-  setExpenseAmounts,
-  setExpenseCategories,
-  addExpenseToCountry,
-  deleteExpense,
-  closeCountry,
-  deleteCountry,
-  getDaysBetweenDates,
-  formatDate,
-  canEdit,
-}: {
-  title: string;
-  emptyMessage: string;
-  countries: Country[];
-  selectedCountryId: number | null;
-  setSelectedCountryId: Dispatch<SetStateAction<number | null>>;
-  expenseAmounts: Record<number, string>;
-  expenseCategories: Record<number, Category>;
-  setExpenseAmounts: Dispatch<SetStateAction<Record<number, string>>>;
-  setExpenseCategories: Dispatch<SetStateAction<Record<number, Category>>>;
-  addExpenseToCountry: (countryId: number) => void;
-  deleteExpense: (countryId: number, expenseId: number) => void;
-  closeCountry: (countryId: number) => void;
-  deleteCountry: (countryId: number) => void;
-  getDaysBetweenDates: (startDate: string, endDate: string | null) => number;
-  formatDate: (date: string | null) => string;
-  canEdit: boolean;
-}) {
-  return (
-    <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-      <h2 className="mb-4 text-xl font-extrabold">{title}</h2>
-
-      {countries.length === 0 && (
-        <p className="text-sm text-[#8b7969]">{emptyMessage}</p>
-      )}
-
-      <div className="space-y-5">
-        {countries.map((country) => {
-          const total = country.expenses.reduce(
-            (sum, expense) => sum + expense.amount,
-            0
-          );
-
-          const percent = Math.round((total / country.budget) * 100 || 0);
-          const isSelected = selectedCountryId === country.id;
-          const days = getDaysBetweenDates(country.startDate, country.endDate);
-          const realDaily = days > 0 ? Math.round(total / days) : 0;
-          const plannedDaily =
-            days > 0 ? Math.round(country.budget / days) : 0;
-          const isOverBudget = total > country.budget;
-          const finalDiff = country.budget - total;
-
-          return (
-            <CountryCard
-              key={country.id}
-              country={country}
-              total={total}
-              percent={percent}
-              isSelected={isSelected}
-              days={days}
-              realDaily={realDaily}
-              plannedDaily={plannedDaily}
-              isOverBudget={isOverBudget}
-              setSelectedCountryId={setSelectedCountryId}
-              expenseAmounts={expenseAmounts}
-              expenseCategories={expenseCategories}
-              setExpenseAmounts={setExpenseAmounts}
-              setExpenseCategories={setExpenseCategories}
-              addExpenseToCountry={addExpenseToCountry}
-              deleteExpense={deleteExpense}
-              closeCountry={closeCountry}
-              deleteCountry={deleteCountry}
-              formatDate={formatDate}
-              canEdit={canEdit}
-              finalDiff={finalDiff}
-            />
-          );
-        })}
-      </div>
-    </section>
-  );
+function AuthScreen({ onClose }: { onClose: () => void }) {
+  const [register, setRegister] = useState(false)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [name, setName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      if (register) { const credential = await createUserWithEmailAndPassword(auth!, email.trim(), password); await updateProfile(credential.user, { displayName: name.trim() }) }
+      else await signInWithEmailAndPassword(auth!, email.trim(), password)
+      onClose()
+    } catch (e) { setError(errorMessage(e)) }
+    finally { setBusy(false) }
+  }
+  return <div className="app-shell auth-shell"><Brand /><section className="welcome"><span className="eyebrow">VOTRE VOYAGE, ENSEMBLE</span><h1>{register ? 'Prêt à prendre le départ ?' : 'Heureux de vous retrouver.'}</h1><p>Un compte personnel, un budget privé, vos compagnons sur invitation.</p>{invitationCode() && <p className="help">Connectez-vous pour accepter l’invitation que vous avez reçue.</p>}</section><section className="card"><h2>{register ? 'Créer un compte' : 'Se connecter'}</h2><form onSubmit={submit} className="form-grid">{register && <label className="full-width">Prénom<input value={name} onChange={e => setName(e.target.value)} maxLength={60} autoComplete="given-name" required /></label>}<label className="full-width">Adresse email<input type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" required /></label><label className="full-width">Mot de passe<input type="password" value={password} onChange={e => setPassword(e.target.value)} minLength={register ? 8 : 1} autoComplete={register ? 'new-password' : 'current-password'} required /></label>{error && <div className="full-width"><Banner error>{error}</Banner></div>}{message && <div className="full-width"><Banner>{message}</Banner></div>}<button className="button full-width" disabled={busy}>{busy ? 'Connexion…' : register ? 'Créer mon compte' : 'Connexion'}</button></form><button className="text-button" onClick={() => { setRegister(!register); setError('') }}>{register ? 'J’ai déjà un compte' : 'Créer un compte'}</button>{!register && <button className="text-button" disabled={busy} onClick={async () => {
+      if (!email.trim()) { setError('Saisissez votre adresse email pour réinitialiser le mot de passe.'); return }
+      setBusy(true)
+      try { await sendPasswordResetEmail(auth!, email.trim()); setMessage('Si cette adresse possède un compte, un email de réinitialisation a été envoyé.') }
+      catch (e) { setError(errorMessage(e)) }
+      finally { setBusy(false) }
+    }}>Mot de passe oublié</button>}</section><button className="text-button" onClick={onClose}>Revenir au voyage sur cet appareil</button><p className="footnote">Connectez-vous sur votre appareil personnel : vos données y seront conservées pour fonctionner hors connexion.</p></div>
 }
-
-function CountryCard({
-  country,
-  total,
-  percent,
-  isSelected,
-  days,
-  realDaily,
-  plannedDaily,
-  isOverBudget,
-  setSelectedCountryId,
-  expenseAmounts,
-  expenseCategories,
-  setExpenseAmounts,
-  setExpenseCategories,
-  addExpenseToCountry,
-  deleteExpense,
-  closeCountry,
-  deleteCountry,
-  formatDate,
-  canEdit,
-  finalDiff,
-}: {
-  country: Country;
-  total: number;
-  percent: number;
-  isSelected: boolean;
-  days: number;
-  realDaily: number;
-  plannedDaily: number;
-  isOverBudget: boolean;
-  setSelectedCountryId: Dispatch<SetStateAction<number | null>>;
-  expenseAmounts: Record<number, string>;
-  expenseCategories: Record<number, Category>;
-  setExpenseAmounts: Dispatch<SetStateAction<Record<number, string>>>;
-  setExpenseCategories: Dispatch<SetStateAction<Record<number, Category>>>;
-  addExpenseToCountry: (countryId: number) => void;
-  deleteExpense: (countryId: number, expenseId: number) => void;
-  closeCountry: (countryId: number) => void;
-  deleteCountry: (countryId: number) => void;
-  formatDate: (date: string | null) => string;
-  canEdit: boolean;
-  finalDiff?: number;
-}) {
-  return (
-    <div
-      onClick={() => setSelectedCountryId(isSelected ? null : country.id)}
-      className={`cursor-pointer transition active:scale-[0.98] ${
-        isSelected
-          ? "rounded-3xl bg-[#fff3e8] p-3 ring-2 ring-[#ef6a2e] shadow-md"
-          : "border-t border-[#ead6c1] pt-4 first:border-t-0 first:pt-0"
-      }`}
-    >
-      <CountryRow
-        country={country}
-        total={total}
-        percent={percent}
-        days={days}
-        realDaily={realDaily}
-      />
-
-      {isSelected && (
-        <>
-          <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
-            <InfoBox
-              label="Période"
-              value={`${formatDate(country.startDate)} → ${formatDate(
-                country.endDate
-              )}`}
-            />
-            <InfoBox label="Durée" value={`${days} jours`} />
-            <InfoBox
-              label="Prévu / jour"
-              value={`${plannedDaily.toLocaleString("fr-FR")} €`}
-            />
-            <InfoBox
-              label="Réel / jour"
-              value={`${realDaily.toLocaleString("fr-FR")} €`}
-            />
-          </div>
-
-          {isOverBudget && (
-            <div className="mt-3 rounded-2xl bg-red-50 p-3 text-sm font-bold text-red-600">
-              ⚠️ Ce pays dépasse son budget prévu.
-            </div>
-          )}
-
-          {!canEdit && typeof finalDiff === "number" && (
-            <div
-              className={`mt-3 rounded-2xl p-3 text-sm font-bold ${
-                finalDiff >= 0
-                  ? "bg-green-50 text-green-700"
-                  : "bg-red-50 text-red-600"
-              }`}
-            >
-              {finalDiff >= 0
-                ? `✅ Pays terminé avec ${finalDiff.toLocaleString(
-                    "fr-FR"
-                  )} € économisés.`
-                : `⚠️ Pays terminé avec ${Math.abs(finalDiff).toLocaleString(
-                    "fr-FR"
-                  )} € de dépassement.`}
-            </div>
-          )}
-
-          <div className="mt-4 rounded-2xl bg-[#fffaf4] p-3">
-            <p className="mb-2 text-sm font-bold text-[#9b5e38]">
-              Dépenses enregistrées
-            </p>
-
-            {country.expenses.length === 0 ? (
-              <p className="text-xs text-[#8b7969]">
-                Aucune dépense ajoutée pour ce pays.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {country.expenses.map((expense) => {
-                  const category = categories.find(
-                    (item) => item.name === expense.category
-                  );
-
-                  return (
-                    <div
-                      key={expense.id}
-                      className="flex items-center justify-between rounded-xl bg-[#fdf6f0] px-3 py-2 text-sm"
-                    >
-                      <span>
-                        {category?.icon || "💸"} {expense.category}
-                      </span>
-
-                      <div className="flex items-center gap-2">
-                        <strong>
-                          {expense.amount.toLocaleString("fr-FR")} €
-                        </strong>
-
-                        {canEdit && !country.closed && (
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              deleteExpense(country.id, expense.id);
-                            }}
-                            className="rounded-full bg-red-50 px-2 py-1 text-xs font-bold text-red-600"
-                          >
-                            ×
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {canEdit && !country.closed && (
-            <>
-              <p className="mt-3 text-sm font-semibold text-[#9b5e38]">
-                Ajouter une dépense à {country.name}
-              </p>
-
-              <div className="mt-2 grid grid-cols-[1fr_1fr_44px] gap-2">
-                <input
-                  type="number"
-                  value={expenseAmounts[country.id] || ""}
-                  onClick={(event) => event.stopPropagation()}
-                  onChange={(event) =>
-                    setExpenseAmounts((previousAmounts) => ({
-                      ...previousAmounts,
-                      [country.id]: event.target.value,
-                    }))
-                  }
-                  placeholder="Montant"
-                  className="rounded-xl border border-[#ead6c1] bg-white px-3 py-2 text-sm outline-none"
-                />
-
-                <select
-                  value={expenseCategories[country.id] || "Logement"}
-                  onClick={(event) => event.stopPropagation()}
-                  onChange={(event) =>
-                    setExpenseCategories((previousCategories) => ({
-                      ...previousCategories,
-                      [country.id]: event.target.value as Category,
-                    }))
-                  }
-                  className="rounded-xl border border-[#ead6c1] bg-white px-3 py-2 text-sm outline-none"
-                >
-                  {categories.map((category) => (
-                    <option key={category.name} value={category.name}>
-                      {category.name}
-                    </option>
-                  ))}
-                </select>
-
-                <button
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    addExpenseToCountry(country.id);
-                  }}
-                  className="rounded-xl bg-[#ef6a2e] text-xl font-extrabold text-white"
-                >
-                  +
-                </button>
-              </div>
-            </>
-          )}
-
-          <div className="mt-3 flex justify-between gap-2">
-            <button
-              onClick={(event) => {
-                event.stopPropagation();
-                deleteCountry(country.id);
-              }}
-              className="rounded-full bg-red-50 px-3 py-1 text-xs font-bold text-red-600"
-            >
-              Supprimer le pays
-            </button>
-
-            {country.closed ? (
-              <span className="rounded-full bg-green-100 px-3 py-1 text-xs font-bold text-green-700">
-                Pays terminé
-              </span>
-            ) : (
-              <button
-                onClick={(event) => {
-                  event.stopPropagation();
-                  closeCountry(country.id);
-                }}
-                className="rounded-full bg-[#f3e2d4] px-3 py-1 text-xs font-bold text-[#9b5e38]"
-              >
-                Terminer ce pays
-              </button>
-            )}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function InfoBox({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-2xl bg-[#fdf6f0] p-3">
-      <p className="text-xs text-[#8b7969]">{label}</p>
-      <p className="font-bold">{value}</p>
-    </div>
-  );
-}
-
-function CountryRow({
-  country,
-  total,
-  percent,
-  days,
-  realDaily,
-}: {
-  country: Country;
-  total: number;
-  percent: number;
-  days: number;
-  realDaily: number;
-}) {
-  return (
-    <div className="flex gap-3">
-      <div className="h-20 w-20 shrink-0 overflow-hidden rounded-2xl bg-[#f1eadf]">
-        {country.imageUrl ? (
-          <img
-            src={country.imageUrl}
-            alt={country.name}
-            className="h-full w-full object-cover"
-          />
-        ) : (
-          <div className="flex h-full w-full items-center justify-center text-3xl">
-            {country.flag}
-          </div>
-        )}
-      </div>
-
-      <div className="min-w-0 flex-1">
-        <div className="flex justify-between gap-3">
-          <div>
-            <h3 className="text-lg font-extrabold">
-              {country.name} {country.flag}
-            </h3>
-
-            <p className="text-sm text-[#8b7969]">
-              {country.closed ? "Terminé" : "En cours"} · {days} jours
-            </p>
-
-            <p className="text-xs text-[#8b7969]">
-              {realDaily.toLocaleString("fr-FR")} €/jour
-            </p>
-          </div>
-
-          <div className="text-right">
-            <p className="font-extrabold">
-              {total.toLocaleString("fr-FR")} €
-            </p>
-
-            <p className="text-xs text-[#8b7969]">
-              / {country.budget.toLocaleString("fr-FR")} €
-            </p>
-          </div>
-        </div>
-
-        <div className="mt-3 flex items-center gap-2">
-          <div className="h-2 flex-1 rounded-full bg-[#eadfd5]">
-            <div
-              className={`h-2 rounded-full ${
-                percent > 100 ? "bg-red-500" : "bg-[#ef6a2e]"
-              }`}
-              style={{ width: `${Math.min(percent, 100)}%` }}
-            />
-          </div>
-
-          <span
-            className={`text-sm font-extrabold ${
-              percent > 100 ? "text-red-500" : "text-[#ef6a2e]"
-            }`}
-          >
-            {percent}%
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ProfileScreen({
-  userName,
-  setUserName,
-  profileImage,
-  setProfileImage,
-  budgetTotal,
-  setBudgetTotal,
-  resetApp,
-}: {
-  userName: string;
-  setUserName: (value: string) => void;
-  profileImage: string;
-  setProfileImage: (value: string) => void;
-  budgetTotal: number;
-  setBudgetTotal: (value: number) => void;
-  resetApp: () => void;
-}) {
-  return (
-    <>
-      <section className="mb-4 rounded-[30px] border border-[#ead6c1] bg-[#fffaf4] p-5 shadow-sm">
-        <h2 className="mb-4 text-xl font-extrabold">Profil utilisateur</h2>
-
-        <div className="mb-4 flex items-center gap-4">
-          <div className="flex h-24 w-24 items-center justify-center overflow-visible rounded-3xl bg-[#f9eadb]">
-            {profileImage ? (
-              <img
-                src={profileImage}
-                alt="Profil"
-                className="h-full w-full object-contain"
-              />
-            ) : (
-              <span className="text-4xl">🎈</span>
-            )}
-          </div>
-
-          <label className="cursor-pointer rounded-full bg-[#ef6a2e] px-4 py-2 text-sm font-extrabold text-white">
-            Changer
-            <input
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (!file) return;
-
-                const reader = new FileReader();
-                reader.onloadend = () => {
-                  setProfileImage(reader.result as string);
-                };
-                reader.readAsDataURL(file);
-              }}
-            />
-          </label>
-        </div>
-
-        <label className="mb-1 block text-sm font-bold text-[#8b7969]">
-          Prénom
-        </label>
-
-        <input
-          value={userName}
-          onChange={(event) => setUserName(event.target.value)}
-          className="mb-4 w-full rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-        />
-
-        <label className="mb-1 block text-sm font-bold text-[#8b7969]">
-          Budget total
-        </label>
-
-        <input
-          type="number"
-          value={budgetTotal}
-          onChange={(event) => setBudgetTotal(Number(event.target.value))}
-          className="w-full rounded-xl border border-[#ead6c1] bg-white px-3 py-2 outline-none"
-        />
-      </section>
-
-      <section className="mb-4 rounded-[30px] border border-red-200 bg-red-50 p-5 shadow-sm">
-        <h2 className="mb-2 text-xl font-extrabold text-red-700">
-          Zone danger
-        </h2>
-
-        <button
-          onClick={resetApp}
-          className="w-full rounded-xl bg-red-600 py-3 font-extrabold text-white"
-        >
-          Réinitialiser l’app
-        </button>
-      </section>
-    </>
-  );
-}
-
-function BottomNav({
-  activeTab,
-  setActiveTab,
-  setSelectedCountryId,
-}: {
-  activeTab: Tab;
-  setActiveTab: Dispatch<SetStateAction<Tab>>;
-  setSelectedCountryId: Dispatch<SetStateAction<number | null>>;
-}) {
-  return (
-    <nav className="fixed bottom-0 left-0 right-0 mx-auto max-w-md px-4 pb-4">
-      <div className="rounded-[28px] border border-[#ead6c1] bg-[#fffaf4]/95 px-6 py-3 shadow-lg backdrop-blur">
-        <div className="grid grid-cols-4 items-center text-xs font-bold">
-          <button
-            onClick={() => {
-              setActiveTab("home");
-              setSelectedCountryId(null);
-            }}
-            className={`flex flex-col items-center justify-center rounded-xl px-2 py-1 transition active:scale-[0.95] ${
-              activeTab === "home" ? "text-[#ef6a2e]" : "text-[#8b7969]"
-            }`}
-          >
-            <span className="text-xl">🏠</span>
-            Accueil
-          </button>
-
-          <button
-            onClick={() => {
-              setActiveTab("countries");
-            }}
-            className={`flex flex-col items-center justify-center rounded-xl px-2 py-1 transition active:scale-[0.95] ${
-              activeTab === "countries" ? "text-[#ef6a2e]" : "text-[#8b7969]"
-            }`}
-          >
-            <span className="text-xl">🌍</span>
-            Pays
-          </button>
-
-          <button
-            onClick={() => {
-              setSelectedCountryId(null);
-              setActiveTab("countries");
-            }}
-            className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-[#ef6a2e] text-3xl font-light leading-none text-white shadow-md transition active:scale-95"
-          >
-            +
-          </button>
-
-          <button
-            onClick={() => {
-            setActiveTab("profile");
-              setSelectedCountryId(null);
-            }}
-            className={`flex flex-col items-center justify-center rounded-xl px-2 py-1 transition active:scale-[0.95] ${
-              activeTab === "profile" ? "text-[#ef6a2e]" : "text-[#8b7969]"
-            }`}
-          >
-            <span className="text-xl">⚙️</span>
-            Profile
-          </button>
-        </div>
-      </div>
-    </nav>
-  );
-}
-
-export default App;
